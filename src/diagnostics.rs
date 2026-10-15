@@ -161,7 +161,12 @@ pub fn enabled() -> bool {
 pub fn record(event: Event) {
     // Keep low-volume stream metadata even while capture is off. Turning capture
     // on must not require reconnecting or changing which CQ owns a stream.
-    if !RECORDING.load(Ordering::Relaxed) && event.event != "stream_bind" {
+    if !RECORDING.load(Ordering::Relaxed)
+        && !matches!(
+            event.event,
+            "stream_bind" | "server_rpc_bind" | "client_rpc_bind"
+        )
+    {
         return;
     }
     if let Some(Some(recorder)) = RECORDER.get() {
@@ -172,6 +177,29 @@ pub fn record(event: Event) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
         }
     }
+}
+
+// Low-volume connection metadata remains available when capture is off.
+// Method codes: 1 = Raft, 2 = BatchRaft, 3 = BatchCommands.
+pub(crate) fn bind_rpc(event: &'static str, call: u64, cq: Option<u64>, method: &[u8]) {
+    if !enabled() {
+        return;
+    }
+    let value = match method {
+        b"/tikvpb.Tikv/Raft" => 1,
+        b"/tikvpb.Tikv/BatchRaft" => 2,
+        b"/tikvpb.Tikv/BatchCommands" => 3,
+        _ => return,
+    };
+    let mut event = Event {
+        call,
+        value,
+        ..Event::new(event)
+    };
+    if let Some(cq) = cq {
+        event.cq = cq;
+    }
+    record(event);
 }
 
 fn capture_from_control(path: Option<&Path>) -> bool {
@@ -318,17 +346,21 @@ mod tests {
             );
             let mut probes = Vec::new();
             let mut bindings = 0;
+            let mut rpc_bindings = Vec::new();
             for line in std::fs::read_to_string(&path).unwrap().lines() {
                 let row: serde_json::Value = serde_json::from_str(line).unwrap();
                 match row["event"].as_str() {
                     Some("probe") => probes.push(row["value"].as_u64().unwrap()),
                     Some("stream_bind") => bindings += 1,
+                    Some("server_rpc_bind" | "client_rpc_bind") => rpc_bindings
+                        .push((row["value"].as_u64().unwrap(), row["cq"].as_u64().unwrap())),
                     Some("trace_stats") => assert_eq!(row["dropped"].as_u64(), Some(0)),
                     _ => {}
                 }
             }
             assert_eq!(probes, vec![2, 4]);
             assert_eq!(bindings, 1);
+            assert_eq!(rpc_bindings, vec![(2, 0), (3, 17)]);
             std::fs::remove_file(path).unwrap();
             std::fs::remove_file(control).unwrap();
             return;
@@ -341,6 +373,14 @@ mod tests {
             request: 22,
         };
         request.record("stream_bind", 99, 0);
+        bind_rpc("server_rpc_bind", 11, None, b"/tikvpb.Tikv/BatchRaft");
+        bind_rpc(
+            "client_rpc_bind",
+            11,
+            Some(17),
+            b"/tikvpb.Tikv/BatchCommands",
+        );
+        bind_rpc("server_rpc_bind", 11, None, b"/other/Unrecorded");
         request.record("probe", 1, 0);
         let control = std::env::var_os("GRPCIO_TRACE_CONTROL").unwrap();
         for (active, value) in [(true, 2), (false, 3), (true, 4)] {

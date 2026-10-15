@@ -879,6 +879,12 @@ fn execute(
     mut checkers: Vec<Box<dyn ServerChecker>>,
 ) {
     let rpc_ctx = RpcContext::new(ctx, cq);
+    crate::diagnostics::bind_rpc(
+        "server_rpc_bind",
+        rpc_ctx.diagnostic_id(),
+        None,
+        rpc_ctx.method(),
+    );
 
     for handler in checkers.iter_mut() {
         match handler.check(&rpc_ctx) {

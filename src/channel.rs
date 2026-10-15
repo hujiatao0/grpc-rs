@@ -762,6 +762,12 @@ impl Channel {
             )
         };
 
+        crate::diagnostics::bind_rpc(
+            "client_rpc_bind",
+            raw_call as u64,
+            Some(cq_ref.as_ptr() as u64),
+            method.name.as_bytes(),
+        );
         unsafe { Ok(Call::from_raw(raw_call, self.cq.clone())) }
     }
 
