@@ -8,7 +8,8 @@ use std::cell::Cell;
 use std::ffi::c_void;
 use std::fs::OpenOptions;
 use std::io::{BufWriter, Write};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::OnceLock;
 use std::thread::{self, Thread};
@@ -23,9 +24,12 @@ thread_local! {
 static RECORDER: OnceLock<Option<Recorder>> = OnceLock::new();
 static DROPPED: AtomicU64 = AtomicU64::new(0);
 static NEXT_SPAN: AtomicU64 = AtomicU64::new(1);
+static RECORDING: AtomicBool = AtomicBool::new(false);
 
 extern "C" {
-    fn grpc_cq_set_diagnostic_callback(callback: unsafe extern "C" fn(*mut c_void, *mut c_void));
+    fn grpc_cq_set_diagnostic_callback(
+        callback: Option<unsafe extern "C" fn(*mut c_void, *mut c_void)>,
+    );
 }
 
 struct Recorder {
@@ -146,7 +150,8 @@ impl Drop for Span {
     }
 }
 
-/// Whether the recorder was enabled at the first environment's creation.
+/// Whether recording was configured at the first environment's creation.
+/// This remains true while runtime capture is off, so stream bindings survive.
 pub fn enabled() -> bool {
     matches!(RECORDER.get(), Some(Some(_)))
 }
@@ -154,6 +159,11 @@ pub fn enabled() -> bool {
 /// Attempts to record without waiting for disk or channel capacity. Any dropped
 /// events invalidate complete-request attribution and are reported every second.
 pub fn record(event: Event) {
+    // Keep low-volume stream metadata even while capture is off. Turning capture
+    // on must not require reconnecting or changing which CQ owns a stream.
+    if !RECORDING.load(Ordering::Relaxed) && event.event != "stream_bind" {
+        return;
+    }
     if let Some(Some(recorder)) = RECORDER.get() {
         let at = recorder.start.elapsed().as_nanos() as u64;
         if let Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) =
@@ -161,6 +171,22 @@ pub fn record(event: Event) {
         {
             DROPPED.fetch_add(1, Ordering::Relaxed);
         }
+    }
+}
+
+fn capture_from_control(path: Option<&Path>) -> bool {
+    match path {
+        None => true,
+        Some(path) => std::fs::read_to_string(path)
+            .map(|value| value.trim() == "on")
+            .unwrap_or(false),
+    }
+}
+
+fn set_recording(active: bool) {
+    RECORDING.store(active, Ordering::Release);
+    unsafe {
+        grpc_cq_set_diagnostic_callback(if active { Some(cq_ready) } else { None });
     }
 }
 
@@ -173,7 +199,7 @@ unsafe extern "C" fn cq_ready(cq: *mut c_void, tag: *mut c_void) {
 }
 
 pub(crate) fn init() {
-    let recorder = RECORDER.get_or_init(|| {
+    RECORDER.get_or_init(|| {
         let path = std::env::var_os("GRPCIO_TRACE_FILE")?;
         // Refuse to append traces from different process/clock lifetimes.
         let file = OpenOptions::new()
@@ -183,6 +209,9 @@ pub(crate) fn init() {
             .expect("create GRPCIO_TRACE_FILE");
         let (sender, receiver) = mpsc::sync_channel::<(u64, Thread, Event)>(65536);
         let start = Instant::now();
+        let control = std::env::var_os("GRPCIO_TRACE_CONTROL").map(std::path::PathBuf::from);
+        let mut active = capture_from_control(control.as_deref());
+        set_recording(active);
         let wall = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -196,10 +225,12 @@ pub(crate) fn init() {
                     writer,
                     "{}",
                     serde_json::json!({"event":"trace_header", "schema":1,
-                "pid":std::process::id(), "unix_ns":wall, "clock":"process_monotonic_ns"})
+                "pid":std::process::id(), "unix_ns":wall, "clock":"process_monotonic_ns",
+                "active":active})
                 )
                 .unwrap();
                 let mut last_flush = Instant::now();
+                let mut last_control = Instant::now();
                 loop {
                     match receiver.recv_timeout(Duration::from_millis(100)) {
                         Ok((at, source, event)) => {
@@ -217,12 +248,31 @@ pub(crate) fn init() {
                         Err(mpsc::RecvTimeoutError::Disconnected) => break,
                         Err(mpsc::RecvTimeoutError::Timeout) => {}
                     }
+                    if last_control.elapsed() >= Duration::from_millis(100) {
+                        let requested = capture_from_control(control.as_deref());
+                        if requested != active {
+                            active = requested;
+                            set_recording(active);
+                            writeln!(
+                                writer,
+                                "{}",
+                                serde_json::json!({
+                                    "event":"trace_control", "active":active,
+                                    "at_ns":start.elapsed().as_nanos() as u64
+                                })
+                            )
+                            .unwrap();
+                            writer.flush().unwrap();
+                        }
+                        last_control = Instant::now();
+                    }
                     if last_flush.elapsed() >= Duration::from_secs(1) {
                         writeln!(
                             writer,
                             "{}",
                             serde_json::json!({"event":"trace_stats",
-                        "dropped":DROPPED.load(Ordering::Relaxed)})
+                        "dropped":DROPPED.load(Ordering::Relaxed), "active":active,
+                        "at_ns":start.elapsed().as_nanos() as u64})
                         )
                         .unwrap();
                         writer.flush().unwrap();
@@ -233,16 +283,87 @@ pub(crate) fn init() {
             .expect("start gRPC diagnostic writer");
         Some(Recorder { start, sender })
     });
-    if recorder.is_some() {
-        unsafe {
-            grpc_cq_set_diagnostic_callback(cq_ready);
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_capture_preserves_bindings_and_suppresses_disabled_events() {
+        if std::env::var_os("GRPCIO_RUNTIME_PROBE_CHILD").is_none() {
+            let path = std::env::temp_dir().join(format!(
+                "grpc-runtime-probe-{}-{}.jsonl",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            let control = path.with_extension("control");
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "diagnostics::tests::runtime_capture_preserves_bindings_and_suppresses_disabled_events",
+                    "--test-threads=1",
+                ])
+                .env("GRPCIO_RUNTIME_PROBE_CHILD", "1")
+                .env("GRPCIO_TRACE_FILE", &path)
+                .env("GRPCIO_TRACE_CONTROL", &control)
+                .output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            let mut probes = Vec::new();
+            let mut bindings = 0;
+            for line in std::fs::read_to_string(&path).unwrap().lines() {
+                let row: serde_json::Value = serde_json::from_str(line).unwrap();
+                match row["event"].as_str() {
+                    Some("probe") => probes.push(row["value"].as_u64().unwrap()),
+                    Some("stream_bind") => bindings += 1,
+                    Some("trace_stats") => assert_eq!(row["dropped"].as_u64(), Some(0)),
+                    _ => {}
+                }
+            }
+            assert_eq!(probes, vec![2, 4]);
+            assert_eq!(bindings, 1);
+            std::fs::remove_file(path).unwrap();
+            std::fs::remove_file(control).unwrap();
+            return;
+        }
+        init();
+        assert!(enabled());
+        assert!(!RECORDING.load(Ordering::Acquire)); // Missing control fails closed.
+        let request = Request {
+            call: 11,
+            request: 22,
+        };
+        request.record("stream_bind", 99, 0);
+        request.record("probe", 1, 0);
+        let control = std::env::var_os("GRPCIO_TRACE_CONTROL").unwrap();
+        for (active, value) in [(true, 2), (false, 3), (true, 4)] {
+            std::fs::write(&control, if active { "on" } else { "off" }).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while RECORDING.load(Ordering::Acquire) != active {
+                assert!(
+                    Instant::now() < deadline,
+                    "control acknowledgement timed out"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+            assert!(enabled());
+            request.record("probe", value, 0);
+        }
+        std::fs::write(&control, "invalid").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while RECORDING.load(Ordering::Acquire) {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(10));
+        }
+        thread::sleep(Duration::from_millis(1200));
+    }
 
     #[test]
     fn native_observer_measures_a_blocked_cq() {
