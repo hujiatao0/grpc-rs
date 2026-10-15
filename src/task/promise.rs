@@ -21,6 +21,7 @@ pub enum BatchType {
 
 /// A promise result which stores a message reader with bundled metadata.
 pub struct BatchResult {
+    pub diagnostic_operation: u64,
     pub message_reader: Option<MessageReader>,
     pub initial_metadata: UnownedMetadata,
     pub trailing_metadata: UnownedMetadata,
@@ -43,6 +44,7 @@ impl BatchResult {
             UnownedMetadata::empty()
         };
         BatchResult {
+            diagnostic_operation: crate::diagnostics::Event::new("batch_result").operation,
             message_reader,
             initial_metadata,
             trailing_metadata,

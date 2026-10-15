@@ -155,6 +155,15 @@ fn build_grpc(cc: &mut cc::Build, library: &str) {
     let dst = {
         let mut config = CmakeConfig::new("grpc");
 
+        // This pinned Abseil predates GCC 14's removal of transitive standard
+        // headers. Keep the diagnostic Linux build compatible without changing
+        // other native dependencies' compiler flags.
+        if get_env("CARGO_CFG_TARGET_OS").as_deref() == Some("linux") {
+            config
+                .cxxflag("-include cstdint")
+                .cxxflag("-include limits");
+        }
+
         if get_env("CARGO_CFG_TARGET_OS").map_or(false, |s| s == "macos") {
             config.cxxflag("-stdlib=libc++");
         }
@@ -246,7 +255,7 @@ fn build_grpc(cc: &mut cc::Build, library: &str) {
         if !cfg!(feature = "_list-package") {
             config.build_target(library);
         }
-        config.uses_cxx11().build()
+        config.build()
     };
 
     let lib_suffix = if target.contains("msvc") {

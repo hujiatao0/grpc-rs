@@ -127,6 +127,11 @@ impl RequestContext {
         let tag_ptr = Box::into_raw(tag);
         unsafe {
             let call = grpc_sys::grpcwrap_request_call_context_get_call(request_ctx);
+            crate::diagnostics::record(crate::diagnostics::Event {
+                call: call as u64,
+                operation: tag_ptr as u64,
+                ..crate::diagnostics::Event::new("recv_submit")
+            });
             let code = grpc_sys::grpcwrap_call_recv_message(call, batch_ctx, tag_ptr as _);
             if code != grpc_call_error::GRPC_CALL_OK {
                 drop(Box::from_raw(tag_ptr));
@@ -296,7 +301,15 @@ impl<T> Stream for RequestStream<T> {
         let t = &mut *self;
         match ready!(t.base.poll(cx, &mut t.call, false)?) {
             None => Poll::Ready(None),
-            Some(data) => Poll::Ready(Some((t.de)(data))),
+            Some(data) => {
+                let call = t.call.lock().call.call as u64;
+                Poll::Ready(Some(diagnostic_decode(
+                    call,
+                    t.base.last_read_operation,
+                    data,
+                    t.de,
+                )))
+            }
         }
     }
 }
@@ -382,7 +395,8 @@ macro_rules! impl_unary_sink {
                 let mut data = match t {
                     Some(t) => {
                         let mut buf = GrpcSlice::default();
-                        if let Err(e) = (self.ser)(&t, &mut buf) {
+                        let call = self.call.as_mut().unwrap().call(|c| c.call.call as u64);
+                        if let Err(e) = super::diagnostic_serialize(call, &t, &mut buf, self.ser) {
                             return $rt {
                                 call: self.call.take().unwrap(),
                                 cq_f: None,
@@ -656,6 +670,12 @@ pub struct RpcContext<'a> {
 }
 
 impl<'a> RpcContext<'a> {
+    /// Process-local call identity for diagnostic correlation; it is not a wire
+    /// identifier and may be reused after the call is destroyed.
+    pub fn diagnostic_id(&self) -> u64 {
+        unsafe { grpc_sys::grpcwrap_request_call_context_get_call(self.ctx.as_ptr()) as u64 }
+    }
+
     fn new(ctx: RequestContext, cq: &CompletionQueue) -> RpcContext<'_> {
         RpcContext {
             deadline: ctx.deadline(),
@@ -725,6 +745,26 @@ macro_rules! accept_call {
     };
 }
 
+fn diagnostic_decode<T>(
+    call: u64,
+    operation: u64,
+    payload: MessageReader,
+    de: DeserializeFn<T>,
+) -> Result<T> {
+    let mut event = crate::diagnostics::Event {
+        call,
+        operation,
+        value: payload.len() as u64,
+        ..crate::diagnostics::Event::new("decode_begin")
+    };
+    crate::diagnostics::record(event);
+    let result = de(payload);
+    event.event = "decode_end";
+    event.value2 = u64::from(result.is_ok());
+    crate::diagnostics::record(event);
+    result
+}
+
 // Helper function to call a unary handler.
 pub fn execute_unary<P, Q, F>(
     ctx: RpcContext<'_>,
@@ -737,7 +777,8 @@ pub fn execute_unary<P, Q, F>(
 {
     let mut call = ctx.call();
     let close_f = accept_call!(call);
-    let request = match de(payload) {
+    let operation = crate::diagnostics::Event::new("unary_decode").operation;
+    let request = match diagnostic_decode(call.call as u64, operation, payload, de) {
         Ok(f) => f,
         Err(e) => {
             let status = RpcStatus::with_message(
@@ -783,7 +824,8 @@ pub fn execute_server_streaming<P, Q, F>(
     let mut call = ctx.call();
     let close_f = accept_call!(call);
 
-    let request = match de(payload) {
+    let operation = crate::diagnostics::Event::new("stream_decode").operation;
+    let request = match diagnostic_decode(call.call as u64, operation, payload, de) {
         Ok(t) => t,
         Err(e) => {
             let status = RpcStatus::with_message(

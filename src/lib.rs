@@ -36,6 +36,7 @@ pub mod channelz;
 mod client;
 mod codec;
 mod cq;
+pub mod diagnostics;
 mod env;
 mod error;
 mod log_util;

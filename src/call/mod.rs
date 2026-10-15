@@ -379,6 +379,13 @@ impl Call {
     ) -> Result<BatchFuture> {
         let _cq_ref = self.cq.borrow()?;
         let f = check_run(BatchType::Finish, |ctx, tag| unsafe {
+            crate::diagnostics::record(crate::diagnostics::Event {
+                call: self.call as u64,
+                cq: self.cq.diagnostic_id(),
+                operation: tag as u64,
+                value: msg.len() as u64,
+                ..crate::diagnostics::Event::new("send_submit")
+            });
             grpc_sys::grpcwrap_call_send_message(
                 self.call,
                 ctx,
@@ -405,6 +412,12 @@ impl Call {
     pub fn start_recv_message(&mut self) -> Result<BatchFuture> {
         let _cq_ref = self.cq.borrow()?;
         let f = check_run(BatchType::Read, |ctx, tag| unsafe {
+            crate::diagnostics::record(crate::diagnostics::Event {
+                call: self.call as u64,
+                cq: self.cq.diagnostic_id(),
+                operation: tag as u64,
+                ..crate::diagnostics::Event::new("recv_submit")
+            });
             grpc_sys::grpcwrap_call_recv_message(self.call, ctx, tag)
         });
         Ok(f)
@@ -438,6 +451,12 @@ impl Call {
         }
 
         let f = check_run(BatchType::Finish, |ctx, tag| unsafe {
+            crate::diagnostics::record(crate::diagnostics::Event {
+                call: self.call as u64,
+                cq: self.cq.diagnostic_id(),
+                operation: tag as u64,
+                ..crate::diagnostics::Event::new("status_submit")
+            });
             let (msg_ptr, msg_len) = if status.code() == RpcStatusCode::OK {
                 (ptr::null(), 0)
             } else {
@@ -609,6 +628,7 @@ impl ShareCallHolder for Arc<Mutex<ShareCall>> {
 
 /// A helper struct for constructing Stream object for batch requests.
 struct StreamingBase {
+    last_read_operation: u64,
     close_f: Option<BatchFuture>,
     msg_f: Option<BatchFuture>,
     read_done: bool,
@@ -617,6 +637,7 @@ struct StreamingBase {
 impl StreamingBase {
     fn new(close_f: Option<BatchFuture>) -> StreamingBase {
         StreamingBase {
+            last_read_operation: 0,
             close_f,
             msg_f: None,
             read_done: false,
@@ -645,7 +666,9 @@ impl StreamingBase {
         let mut bytes = None;
         if !self.read_done {
             if let Some(msg_f) = &mut self.msg_f {
-                bytes = ready!(Pin::new(msg_f).poll(cx)?).message_reader;
+                let result = ready!(Pin::new(msg_f).poll(cx)?);
+                self.last_read_operation = result.diagnostic_operation;
+                bytes = result.message_reader;
                 if bytes.is_none() {
                     self.read_done = true;
                 }
@@ -720,6 +743,19 @@ impl WriteFlags {
     }
 }
 
+/// Serializes a message while recording its diagnostic encode interval.
+pub(crate) fn diagnostic_serialize<T>(
+    call: u64,
+    message: &T,
+    buffer: &mut GrpcSlice,
+    serialize: crate::codec::SerializeFn<T>,
+) -> Result<()> {
+    let mut span = crate::diagnostics::Span::new("encode_begin", "encode_end", call);
+    let result = serialize(message, buffer);
+    span.set_value(buffer.len() as u64);
+    result
+}
+
 /// A helper struct for constructing Sink object for batch requests.
 struct SinkBase {
     // Batch job to be executed in `poll_ready`.
@@ -762,7 +798,7 @@ impl SinkBase {
         // temporary fix: buffer hint with send meta will not send out any metadata.
         // note: only the first message can enter this code block.
         if self.send_metadata {
-            ser(t, &mut self.buffer)?;
+            diagnostic_serialize(call.call(|c| c.call.call as u64), t, &mut self.buffer, ser)?;
             self.buf_flags = Some(flags);
             self.start_send_buffer_message(false, call, call_flags)?;
             self.send_metadata = false;
@@ -775,7 +811,7 @@ impl SinkBase {
             self.start_send_buffer_message(true, call, call_flags)?;
         }
 
-        ser(t, &mut self.buffer)?;
+        diagnostic_serialize(call.call(|c| c.call.call as u64), t, &mut self.buffer, ser)?;
         let hint = flags.get_buffer_hint();
         self.last_buf_hint &= hint;
         self.buf_flags = Some(flags);
@@ -792,9 +828,15 @@ impl SinkBase {
     fn poll_ready(&mut self, cx: &mut Context) -> Poll<Result<()>> {
         match &mut self.batch_f {
             None => return Poll::Ready(Ok(())),
-            Some(f) => {
-                ready!(Pin::new(f).poll(cx)?);
-            }
+            Some(f) => match Pin::new(f).poll(cx)? {
+                Poll::Pending => {
+                    crate::diagnostics::record(crate::diagnostics::Event::new("send_wait_poll"));
+                    return Poll::Pending;
+                }
+                Poll::Ready(_) => {
+                    crate::diagnostics::record(crate::diagnostics::Event::new("send_ready"));
+                }
+            },
         }
         self.batch_f.take();
         Poll::Ready(Ok(()))

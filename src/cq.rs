@@ -213,6 +213,10 @@ pub struct CompletionQueue {
 }
 
 impl CompletionQueue {
+    pub(crate) fn diagnostic_id(&self) -> u64 {
+        self.handle.cq as u64
+    }
+
     pub fn new(handle: Arc<CompletionQueueHandle>, worker: Arc<WorkQueue>) -> CompletionQueue {
         CompletionQueue { handle, worker }
     }

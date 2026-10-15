@@ -15,6 +15,7 @@ fn poll_queue(tx: mpsc::Sender<CompletionQueue>, non_listening: bool) {
     let cq = Arc::new(CompletionQueueHandle::new(non_listening));
     let worker_info = Arc::new(WorkQueue::new());
     let cq = CompletionQueue::new(cq, worker_info);
+    crate::diagnostics::set_cq(cq.diagnostic_id());
     tx.send(cq.clone()).expect("send back completion queue");
     loop {
         let e = cq.next();
@@ -25,12 +26,19 @@ fn poll_queue(tx: mpsc::Sender<CompletionQueue>, non_listening: bool) {
             EventType::GRPC_OP_COMPLETE => {}
         }
 
+        let operation = e.tag as u64;
+        crate::diagnostics::record(crate::diagnostics::Event {
+            operation,
+            ..crate::diagnostics::Event::new("cq_pop")
+        });
+        let _operation = crate::diagnostics::OperationScope::enter(operation);
         let tag: Box<CallTag> = unsafe { Box::from_raw(e.tag as _) };
 
         tag.resolve(&cq, e.success != 0);
         while let Some(work) = unsafe { cq.worker.pop_work() } {
             work.finish();
         }
+        crate::diagnostics::record(crate::diagnostics::Event::new("cq_dispatch_end"));
     }
 }
 
@@ -98,6 +106,7 @@ impl EnvBuilder {
 
     /// Finalize the [`EnvBuilder`], build the [`Environment`] and initialize the gRPC library.
     pub fn build(self) -> Environment {
+        crate::diagnostics::init();
         unsafe {
             grpc_sys::grpc_init();
         }

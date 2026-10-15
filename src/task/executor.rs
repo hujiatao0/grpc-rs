@@ -148,6 +148,15 @@ pub fn resolve(task: Arc<SpawnTask>, success: bool) {
 /// same thread as inner cq.
 impl ArcWake for SpawnTask {
     fn wake_by_ref(task: &Arc<Self>) {
+        if crate::diagnostics::enabled() {
+            crate::diagnostics::record(crate::diagnostics::Event {
+                call: task.kicker.call.call as u64,
+                cq: task.kicker.call.cq.diagnostic_id(),
+                operation: Arc::as_ptr(task) as u64,
+                value: u64::from(task.state.load(Ordering::Acquire)),
+                ..crate::diagnostics::Event::new("task_wake")
+            });
+        }
         if !task.mark_notified() {
             return;
         }
@@ -199,12 +208,25 @@ fn poll(task: Arc<SpawnTask>, woken: bool) {
         let mut cx = Context::from_waker(&waker);
 
         // L208 "lock"s state, hence it's safe to get a mutable reference.
-        match unsafe { &mut *task.handle.get() }
+        let _request = crate::diagnostics::Request {
+            call: task.kicker.call.call as u64,
+            request: 0,
+        }
+        .enter();
+        let mut event = crate::diagnostics::Event {
+            operation: Arc::as_ptr(&task) as u64,
+            ..crate::diagnostics::Event::new("task_poll_begin")
+        };
+        crate::diagnostics::record(event);
+        let result = unsafe { &mut *task.handle.get() }
             .as_mut()
             .unwrap()
             .as_mut()
-            .poll(&mut cx)
-        {
+            .poll(&mut cx);
+        event.event = "task_poll_end";
+        event.value = u64::from(result.is_ready());
+        crate::diagnostics::record(event);
+        match result {
             Poll::Ready(()) => {
                 task.state.store(COMPLETED, Ordering::Release);
                 unsafe { &mut *task.handle.get() }.take();
