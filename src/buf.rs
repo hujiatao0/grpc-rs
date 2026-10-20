@@ -304,6 +304,7 @@ pub struct GrpcByteBufferReader {
     offset: usize,
     /// How many bytes pending for reading.
     remain: usize,
+    diagnostic_operation: u64,
 }
 
 impl GrpcByteBufferReader {
@@ -328,6 +329,7 @@ impl GrpcByteBufferReader {
                 slice: ManuallyDrop::new(GrpcSlice(s.assume_init())),
                 offset: 0,
                 remain,
+                diagnostic_operation: 0,
             }
         }
     }
@@ -346,6 +348,16 @@ impl GrpcByteBufferReader {
     #[inline]
     pub fn len(&self) -> usize {
         self.remain
+    }
+
+    /// Process-local receive completion identity retained when decoding moves
+    /// from the call's completion queue to another executor.
+    pub fn diagnostic_operation(&self) -> u64 {
+        self.diagnostic_operation
+    }
+
+    pub(crate) fn set_diagnostic_operation(&mut self, operation: u64) {
+        self.diagnostic_operation = operation;
     }
 
     #[inline]
@@ -453,6 +465,17 @@ mod tests {
         let data = vec![GrpcSlice::from(seed); copy_count];
         let buf = GrpcByteBuffer::from(data.as_slice());
         GrpcByteBufferReader::new(buf)
+    }
+
+    #[test]
+    fn test_reader_retains_receive_identity_after_move_and_read() {
+        let mut reader = new_message_reader(vec![1, 2, 3], 2);
+        reader.set_diagnostic_operation(123);
+        let mut moved = std::thread::spawn(move || reader).join().unwrap();
+        let mut data = Vec::new();
+        moved.read_to_end(&mut data).unwrap();
+        assert_eq!(data, vec![1, 2, 3, 1, 2, 3]);
+        assert_eq!(moved.diagnostic_operation(), 123);
     }
 
     #[test]

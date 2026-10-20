@@ -748,9 +748,10 @@ macro_rules! accept_call {
 fn diagnostic_decode<T>(
     call: u64,
     operation: u64,
-    payload: MessageReader,
+    mut payload: MessageReader,
     de: DeserializeFn<T>,
 ) -> Result<T> {
+    payload.set_diagnostic_operation(operation);
     let mut event = crate::diagnostics::Event {
         call,
         operation,
@@ -763,6 +764,21 @@ fn diagnostic_decode<T>(
     event.value2 = u64::from(result.is_ok());
     crate::diagnostics::record(event);
     result
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+    use crate::buf::{GrpcByteBuffer, GrpcSlice};
+
+    #[test]
+    fn test_raw_decoder_retains_native_receive_operation() {
+        let slice = GrpcSlice::from(vec![1, 2, 3]);
+        let payload = MessageReader::new(GrpcByteBuffer::from(&slice));
+        let reader = diagnostic_decode(7, 123, payload, Ok).unwrap();
+        let reader = std::thread::spawn(move || reader).join().unwrap();
+        assert_eq!(reader.diagnostic_operation(), 123);
+    }
 }
 
 // Helper function to call a unary handler.

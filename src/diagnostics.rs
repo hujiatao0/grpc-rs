@@ -142,6 +142,11 @@ impl Span {
     pub fn set_value(&mut self, value: u64) {
         self.end.value = value;
     }
+
+    /// Correlates application request IDs with this synchronous or async span.
+    pub fn operation_id(&self) -> u64 {
+        self.end.operation
+    }
 }
 
 impl Drop for Span {
